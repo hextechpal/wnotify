@@ -1,36 +1,36 @@
 package mongo
 
 import (
-	"bytes"
 	"context"
-	"encoding/gob"
+	"errors"
 	"fmt"
 	"github.com/hextechpal/wnotify/internal/waiter"
-	"github.com/hextechpal/wnotify/types"
 	"github.com/kamva/mgm/v3"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"sync"
 	"time"
 )
 
 type waitService struct {
+	mu       sync.Mutex
+	registry map[waiter.CallbackType]waiter.Callback
 }
 
+// NewWaitService : Initializes new mongo based waitService
 func NewWaitService(dbName, connStr string) (*waitService, error) {
 	opts := options.Client().ApplyURI(connStr)
 	err := mgm.SetDefaultConfig(&mgm.Config{CtxTimeout: 5 * time.Second}, dbName, opts)
 	if err != nil {
 		return nil, err
 	}
-	ws := &waitService{}
-	go ws.watch(mgm.Coll(&waiter.WaitInstance{}).Collection)
-	time.Sleep(time.Second)
-	return ws, nil
+	return &waitService{registry: make(map[waiter.CallbackType]waiter.Callback)}, nil
 }
 
-func (ws *waitService) WaitOn(ctx context.Context, cb types.CallbackType, notifyIds ...string) error {
-	wi := &waiter.WaitInstance{
+// WaitOn : Create a wait instance record with notifyIds
+func (ws *waitService) WaitOn(ctx context.Context, cb waiter.CallbackType, notifyIds ...string) error {
+	wi := &waitInstance{
 		NotifyIds:        notifyIds,
 		WaitingNotifyIds: notifyIds,
 		CallbackType:     cb,
@@ -43,8 +43,9 @@ func (ws *waitService) WaitOn(ctx context.Context, cb types.CallbackType, notify
 	return nil
 }
 
+// Done : Create a notify response data
 func (ws *waitService) Done(ctx context.Context, notifyId string, data interface{}) error {
-	b, err := GetBytes(data)
+	b, err := waiter.GetBytes(data)
 	if err != nil {
 		fmt.Println(err.Error())
 		return err
@@ -52,11 +53,11 @@ func (ws *waitService) Done(ctx context.Context, notifyId string, data interface
 
 	filter := bson.M{"waitingNotifyIds": notifyId}
 	update := bson.D{
-		{"$pull", bson.D{{"waitingNotifyIds", notifyId}}},
+		{Key: "$pull", Value: bson.D{{"waitingNotifyIds", notifyId}}},
 	}
 
 	return mgm.TransactionWithCtx(ctx, func(session mongo.Session, sc mongo.SessionContext) error {
-		err = mgm.Coll(&waiter.NotifyResponse{}).CreateWithCtx(sc, &waiter.NotifyResponse{
+		err = mgm.Coll(&notifyResponse{}).CreateWithCtx(sc, &notifyResponse{
 			NotifyId: notifyId,
 			Data:     b,
 		})
@@ -65,40 +66,53 @@ func (ws *waitService) Done(ctx context.Context, notifyId string, data interface
 			return err
 		}
 
-		sr := mgm.Coll(&waiter.WaitInstance{}).FindOneAndUpdate(ctx, filter, update)
+		wi := &waitInstance{}
+		sr := mgm.Coll(wi).FindOneAndUpdate(ctx, filter, update)
 		if sr.Err() != nil {
 			fmt.Println(err.Error())
 			return sr.Err()
+		}
+		if len(wi.WaitingNotifyIds) == 0 {
+			fmt.Printf("wait instance finished %v\n", wi.ID)
+			//TODO : Add it in queue for processing
 		}
 		return session.CommitTransaction(sc)
 	})
 }
 
-func (ws *waitService) watch(collection *mongo.Collection) {
-	ctx := context.Background()
-	cs, err := collection.Watch(ctx, mongo.Pipeline{})
-	if err != nil {
-		fmt.Println(err.Error())
+func (ws *waitService) RegisterCallback(cb waiter.Callback) error {
+	if cb == nil {
+		return errors.New("callback cannot be nil")
 	}
-	// Whenever there is a new change event, decode the change event and print some information about it
-	for cs.Next(ctx) {
-		var ce waiter.ChangeEvent
-		err := cs.Decode(&ce)
-		if err != nil {
-			fmt.Printf(err.Error())
-			continue
-		}
-		fmt.Printf("%v\n", ce)
+	_, ok := ws.registry[cb.GetType()]
+	if ok {
+		return errors.New("duplicate callback registration")
 	}
-
+	ws.registry[cb.GetType()] = cb
+	return nil
 }
 
-func GetBytes(d interface{}) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	err := enc.Encode(d)
-	if err != nil {
-		return nil, err
+func (ws *waitService) Notify(ctx context.Context, wi *waitInstance) error {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	res := make(map[string][]byte)
+	cb, ok := ws.registry[wi.CallbackType]
+	if ok {
+		return errors.New(fmt.Sprintf("no callback present for type %s", wi.CallbackType))
 	}
-	return buf.Bytes(), nil
+	filter := bson.M{"NotifyId": bson.M{"&in": wi.NotifyIds}}
+	cursor, err := mgm.Coll(&notifyResponse{}).Find(ctx, filter)
+	if err != nil {
+		return err
+	}
+
+	for cursor.Next(ctx) {
+		var nr notifyResponse
+		err := cursor.Decode(&nr)
+		if err != nil {
+			return err
+		}
+		res[nr.NotifyId] = nr.Data
+	}
+	return cb.Notify(res, false)
 }
