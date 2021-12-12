@@ -44,17 +44,18 @@ func (ws *waitService) WaitOn(ctx context.Context, cb types.CallbackType, notify
 }
 
 func (ws *waitService) Done(ctx context.Context, notifyId string, data interface{}) error {
+	b, err := GetBytes(data)
+	if err != nil {
+		fmt.Println(err.Error())
+		return err
+	}
+
 	filter := bson.M{"waitingNotifyIds": notifyId}
 	update := bson.D{
 		{"$pull", bson.D{{"waitingNotifyIds", notifyId}}},
 	}
 
 	return mgm.TransactionWithCtx(ctx, func(session mongo.Session, sc mongo.SessionContext) error {
-		b, err := GetBytes(data)
-		if err != nil {
-			fmt.Println(err.Error())
-			return err
-		}
 		err = mgm.Coll(&waiter.NotifyResponse{}).CreateWithCtx(sc, &waiter.NotifyResponse{
 			NotifyId: notifyId,
 			Data:     b,
@@ -71,7 +72,6 @@ func (ws *waitService) Done(ctx context.Context, notifyId string, data interface
 		}
 		return session.CommitTransaction(sc)
 	})
-
 }
 
 func (ws *waitService) watch(collection *mongo.Collection) {

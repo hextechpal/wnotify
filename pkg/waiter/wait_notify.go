@@ -20,7 +20,7 @@ type WaitNotify struct {
 
 func NewWaitNotify(config *Config) (*WaitNotify, error) {
 	ws, err := mongo.NewWaitService(config.DbName, config.ConnStr)
-	if err != nil{
+	if err != nil {
 		return nil, err
 	}
 	return &WaitNotify{ws: ws, registry: make(map[types.CallbackType]types.Callback)}, nil

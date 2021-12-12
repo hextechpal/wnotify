@@ -53,5 +53,5 @@ func TestWaitNotify_WaitOn(t *testing.T) {
 		t.FailNow()
 	}
 
-	time.Sleep(3*time.Second)
+	time.Sleep(3 * time.Second)
 }
